@@ -485,6 +485,8 @@ class Panel extends Component<PanelProps & PathPrefixProps, PanelState> {
               metricNames={metricNames}
               executeExplain={this.getExplainOutput}
               disableExplain={this.props.options.engine === 'prometheus'}
+              tenant={this.props.options.tenant}
+              tenantHeader={tenantHeader}
             />
           </Col>
         </Row>

@@ -24,6 +24,8 @@ describe('ExpressionInput', () => {
       // Do nothing.
     },
     disableExplain: false,
+    tenant: 'default-tenant',
+    tenantHeader: 'thanos-tenant',
   };
 
   let expressionInput: ReactWrapper;

@@ -20,6 +20,238 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faSearch, faSpinner } from '@fortawesome/free-solid-svg-icons';
 import PathPrefixProps from '../../types/PathPrefixProps';
 import { useTheme } from '../../contexts/ThemeContext';
+import {
+  HTTPPrometheusClient,
+  MetricMetadata,
+  PrometheusClient,
+  PrometheusConfig,
+} from '@prometheus-io/codemirror-promql/dist/esm/client/prometheus';
+import { Matcher } from '@prometheus-io/codemirror-promql/dist/esm/types/matcher';
+import { FetchFn } from '@prometheus-io/codemirror-promql/dist/esm/client';
+import { labelMatchersToString } from '@prometheus-io/codemirror-promql/dist/esm/parser';
+
+// These are status codes where the Prometheus API still returns a valid JSON body,
+// with an error encoded within the JSON.
+const badRequest = 400;
+const unprocessableEntity = 422;
+const serviceUnavailable = 503;
+
+interface APIResponse<T> {
+  status: 'success' | 'error';
+  data?: T;
+  error?: string;
+  warnings?: string[];
+}
+
+export class CustomHTTPPrometheusClient implements PrometheusClient {
+  private readonly lookbackInterval = 60 * 60 * 1000 * 12; //12 hours
+  private readonly url: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private readonly errorHandler?: (error: any) => void;
+  private readonly httpMethod: 'POST' | 'GET' = 'POST';
+  private readonly apiPrefix: string = '/api/v1';
+  // For some reason, just assigning via "= fetch" here does not end up executing fetch correctly
+  // when calling it, thus the indirection via another function wrapper.
+  private readonly fetchFn: FetchFn = (input: RequestInfo, init?: RequestInit): Promise<Response> => fetch(input, init);
+  private requestHeaders: Headers = new Headers();
+
+  constructor(config: PrometheusConfig) {
+    this.url = config.url ? config.url : '';
+    this.errorHandler = config.httpErrorHandler;
+    if (config.lookbackInterval) {
+      this.lookbackInterval = config.lookbackInterval;
+    }
+    if (config.fetchFn) {
+      this.fetchFn = config.fetchFn;
+    }
+    if (config.httpMethod) {
+      this.httpMethod = config.httpMethod;
+    }
+    if (config.apiPrefix) {
+      this.apiPrefix = config.apiPrefix;
+    }
+  }
+
+  setHeader(headerName: string, headerValue: string) {
+    this.requestHeaders.set(headerName, headerValue);
+  }
+
+  labelNames(metricName?: string): Promise<string[]> {
+    const end = new Date();
+    const start = new Date(end.getTime() - this.lookbackInterval);
+
+    if (metricName === undefined || metricName === '') {
+      const request = this.buildRequest(
+        this.labelsEndpoint(),
+        new URLSearchParams({
+          start: start.toISOString(),
+          end: end.toISOString(),
+        })
+      );
+
+      // See https://prometheus.io/docs/prometheus/latest/querying/api/#getting-label-names
+      return this.fetchAPI<string[]>(request.uri, {
+        method: this.httpMethod,
+        body: request.body,
+        headers: this.requestHeaders,
+      }).catch((error) => {
+        if (this.errorHandler) {
+          this.errorHandler(error);
+        }
+        return [];
+      });
+    }
+
+    return this.series(metricName).then((series) => {
+      const labelNames = new Set<string>();
+      for (const labelSet of series) {
+        for (const [key] of Object.entries(labelSet)) {
+          if (key === '__name__') {
+            continue;
+          }
+          labelNames.add(key);
+        }
+      }
+      return Array.from(labelNames);
+    });
+  }
+
+  // labelValues return a list of the value associated to the given labelName.
+  // In case a metric is provided, then the list of values is then associated to the couple <MetricName, LabelName>
+  labelValues(labelName: string, metricName?: string, matchers?: Matcher[]): Promise<string[]> {
+    const end = new Date();
+    const start = new Date(end.getTime() - this.lookbackInterval);
+
+    if (!metricName || metricName.length === 0) {
+      const params: URLSearchParams = new URLSearchParams({
+        start: start.toISOString(),
+        end: end.toISOString(),
+      });
+      // See https://prometheus.io/docs/prometheus/latest/querying/api/#querying-label-values
+      return this.fetchAPI<string[]>(`${this.labelValuesEndpoint().replace(/:name/gi, labelName)}?${params}`, {
+        headers: this.requestHeaders,
+      }).catch((error) => {
+        if (this.errorHandler) {
+          this.errorHandler(error);
+        }
+        return [];
+      });
+    }
+
+    return this.series(metricName, matchers, labelName).then((series) => {
+      const labelValues = new Set<string>();
+      for (const labelSet of series) {
+        for (const [key, value] of Object.entries(labelSet)) {
+          if (key === '__name__') {
+            continue;
+          }
+          if (key === labelName) {
+            labelValues.add(value);
+          }
+        }
+      }
+      return Array.from(labelValues);
+    });
+  }
+
+  metricMetadata(): Promise<Record<string, MetricMetadata[]>> {
+    return this.fetchAPI<Record<string, MetricMetadata[]>>(this.metricMetadataEndpoint(), {
+      headers: this.requestHeaders,
+    }).catch((error) => {
+      if (this.errorHandler) {
+        this.errorHandler(error);
+      }
+      return {};
+    });
+  }
+
+  series(metricName: string, matchers?: Matcher[], labelName?: string): Promise<Map<string, string>[]> {
+    const end = new Date();
+    const start = new Date(end.getTime() - this.lookbackInterval);
+    const request = this.buildRequest(
+      this.seriesEndpoint(),
+      new URLSearchParams({
+        start: start.toISOString(),
+        end: end.toISOString(),
+        'match[]': labelMatchersToString(metricName, matchers, labelName),
+      })
+    );
+    // See https://prometheus.io/docs/prometheus/latest/querying/api/#finding-series-by-label-matchers
+    return this.fetchAPI<Map<string, string>[]>(request.uri, {
+      method: this.httpMethod,
+      body: request.body,
+      headers: this.requestHeaders,
+    }).catch((error) => {
+      if (this.errorHandler) {
+        this.errorHandler(error);
+      }
+      return [];
+    });
+  }
+
+  metricNames(): Promise<string[]> {
+    return this.labelValues('__name__');
+  }
+
+  flags(): Promise<Record<string, string>> {
+    return this.fetchAPI<Record<string, string>>(this.flagsEndpoint(), { headers: this.requestHeaders }).catch((error) => {
+      if (this.errorHandler) {
+        this.errorHandler(error);
+      }
+      return {};
+    });
+  }
+
+  private fetchAPI<T>(resource: string, init?: RequestInit): Promise<T> {
+    return this.fetchFn(this.url + resource, init)
+      .then((res) => {
+        if (!res.ok && ![badRequest, unprocessableEntity, serviceUnavailable].includes(res.status)) {
+          throw new Error(res.statusText);
+        }
+        return res;
+      })
+      .then((res) => res.json())
+      .then((apiRes: APIResponse<T>) => {
+        if (apiRes.status === 'error') {
+          throw new Error(apiRes.error !== undefined ? apiRes.error : 'missing "error" field in response JSON');
+        }
+        if (apiRes.data === undefined) {
+          throw new Error('missing "data" field in response JSON');
+        }
+        return apiRes.data;
+      });
+  }
+
+  private buildRequest(endpoint: string, params: URLSearchParams) {
+    let uri = endpoint;
+    let body: URLSearchParams | null = params;
+    if (this.httpMethod === 'GET') {
+      uri = `${uri}?${params}`;
+      body = null;
+    }
+    return { uri, body };
+  }
+
+  private labelsEndpoint(): string {
+    return `${this.apiPrefix}/labels`;
+  }
+
+  private labelValuesEndpoint(): string {
+    return `${this.apiPrefix}/label/:name/values`;
+  }
+
+  private seriesEndpoint(): string {
+    return `${this.apiPrefix}/series`;
+  }
+
+  private metricMetadataEndpoint(): string {
+    return `${this.apiPrefix}/metadata`;
+  }
+
+  private flagsEndpoint(): string {
+    return `${this.apiPrefix}/status/flags`;
+  }
+}
 
 const promqlExtension = new PromQLExtension();
 
@@ -35,6 +267,8 @@ interface CMExpressionInputProps {
   enableLinter: boolean;
   executeExplain: () => void;
   disableExplain: boolean;
+  tenant: string;
+  tenantHeader: string;
 }
 
 const dynamicConfigCompartment = new Compartment();
@@ -96,10 +330,19 @@ const ExpressionInput: FC<PathPrefixProps & CMExpressionInputProps> = ({
   enableLinter,
   executeExplain,
   disableExplain,
+  tenant,
+  tenantHeader,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const customClientTwo = new CustomHTTPPrometheusClient({
+    url: pathPrefix ? pathPrefix : '',
+    cache: { initialMetricList: metricNames },
+  });
   const { theme } = useTheme();
+  if (tenant.length > 0) {
+    customClientTwo.setHeader(tenantHeader, tenant);
+  }
   // (Re)initialize editor based on settings / setting changes.
   useEffect(() => {
     // Build the dynamic part of the config.
@@ -107,9 +350,10 @@ const ExpressionInput: FC<PathPrefixProps & CMExpressionInputProps> = ({
       .activateCompletion(enableAutocomplete)
       .activateLinter(enableLinter)
       .setComplete({
+        remote: customClientTwo,
         completeStrategy: new HistoryCompleteStrategy(
           newCompleteStrategy({
-            remote: { url: pathPrefix ? pathPrefix : '', cache: { initialMetricList: metricNames } },
+            remote: customClientTwo,
           }),
           queryHistory
         ),
